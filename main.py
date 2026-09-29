@@ -12,8 +12,9 @@ from huggingface_hub import hf_hub_download
 from tensorflow.keras.applications import EfficientNetB0
 from tensorflow.keras.applications.efficientnet import preprocess_input
 
-# Strict RAM conservation for Render 512MB limit
-tf.config.set_soft_device_placement(True)
+# Force single-threaded CPU execution to eliminate thread memory bloat on 512MB RAM
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
 
 app = FastAPI(title="AquaPath Low-RAM Engine")
 
@@ -53,7 +54,7 @@ model, base_model = build_model()
 weights_path = hf_hub_download(repo_id=REPO_ID, filename=WEIGHT_FILE)
 model.load_weights(weights_path)
 
-# Extract final convolutional block
+# Isolate last feature layer
 target_layer = [l for l in base_model.layers if 'top_conv' in l.name or 'conv' in l.name][-1]
 grad_model = tf.keras.models.Model(inputs=[model.inputs], outputs=[target_layer.output, model.output])
 
@@ -63,17 +64,18 @@ def health_check():
 
 @app.post("/predict")
 async def predict_api(file: UploadFile = File(...)):
+    # 1. Read and immediately discard raw bytes
     contents = await file.read()
     pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
     orig_np = np.array(pil_img)
     del contents
     gc.collect()
 
-    # Preprocess image
+    # 2. Downscale to 224x224
     img_resized = cv2.resize(orig_np, (224, 224), interpolation=cv2.INTER_AREA)
     x = preprocess_input(np.expand_dims(img_resized.astype(np.float32), axis=0))
 
-    # Compute predictions and feature activations
+    # 3. Memory-guarded GradientTape
     with tf.GradientTape() as tape:
         conv_outputs, predictions = grad_model(x)
         top_idx = tf.argmax(predictions[0])
@@ -82,10 +84,12 @@ async def predict_api(file: UploadFile = File(...)):
     grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2)).numpy()
     conv_outputs = conv_outputs[0].numpy()
-    del grads
+    
+    # Immediately drop gradient references from RAM
+    del tape, grads
     gc.collect()
 
-    # Heatmap rendering
+    # 4. Generate Heatmap
     cam = np.zeros(conv_outputs.shape[0:2], dtype=np.float32)
     for i in range(len(pooled_grads)):
         cam += pooled_grads[i] * conv_outputs[:, :, i]
@@ -102,7 +106,7 @@ async def predict_api(file: UploadFile = File(...)):
     _, buffer = cv2.imencode('.jpg', cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     b64_cam = "data:image/jpeg;base64," + base64.b64encode(buffer).decode('utf-8')
 
-    # Temperature Scaling (T = 0.45) for calibrated 95%+ confidence output
+    # 5. Calibrate Probabilities
     raw_probs = predictions[0].numpy()
     logits = np.log(np.clip(raw_probs, 1e-7, 1.0))
     calibrated = np.exp(logits / 0.45)
@@ -111,7 +115,8 @@ async def predict_api(file: UploadFile = File(...)):
     confidences = {CLASSES[i]: float(calibrated_probs[i]) for i in range(len(CLASSES))}
     winner = CLASSES[int(np.argmax(calibrated_probs))]
 
-    del orig_np, img_resized, overlay, buffer
+    # 6. Strict cleanup
+    del orig_np, img_resized, overlay, buffer, conv_outputs, pooled_grads, cam, heatmap
     gc.collect()
 
     return JSONResponse(content={
